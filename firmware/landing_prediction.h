@@ -21,26 +21,24 @@
 extern "C" {
 #endif
 
-/* ─── Input: fused sensor snapshot passed every cycle ─────────────────── */
+/* ─── Input: sensor snapshot from TelemetrySnapshot ──────────────────── */
 typedef struct {
-    /* BMP280 — barometric altitude */
-    float altitude_m;        /* metres above ground (AGL)                  */
-    float pressure_pa;       /* raw pressure in Pascals                    */
+    /* Barometric altitude */
+    float altitude_m;        /* baro_altitude: metres above ground (AGL)   */
+    float temperature;       /* temperature: degrees Celsius               */
 
-    /* NEO-6M — GNSS fix */
-    float gps_lat;           /* decimal degrees, WGS-84                    */
-    float gps_lon;           /* decimal degrees, WGS-84                    */
-    float gps_alt_m;         /* GPS altitude (metres)                      */
-    int   fix_type;          /* 0 = none, 2 = 2-D, 3 = 3-D                */
-    float hdop;              /* horizontal dilution of precision           */
+    /* GPS fix */
+    double gps_lat;          /* latitude: decimal degrees, WGS-84          */
+    double gps_lon;          /* longitude: decimal degrees, WGS-84         */
+    float  gps_alt_m;        /* gps_altitude: metres                       */
+    int    gps_satellites;   /* gps_satellites: number of satellites       */
+    int    gps_fix_quality;  /* gps_fix_quality: 0=none, 1=GPS, 2=DGPS     */
+    float  gps_speed;        /* gps_speed: m/s (optional, can use for validation) */
 
-    /* MPU6500 — IMU (reserved for future fusion) */
-    float accel_x;           /* m/s²                                       */
-    float accel_y;           /* m/s²                                       */
-    float accel_z;           /* m/s²                                       */
-    float gyro_x;            /* °/s                                        */
-    float gyro_y;            /* °/s                                        */
-    float gyro_z;            /* °/s                                        */
+    /* IMU (reserved for future fusion) */
+    float accel_x;           /* accel_x: m/s²                              */
+    float accel_y;           /* accel_y: m/s²                              */
+    float accel_z;           /* accel_z: m/s²                              */
 } SensorData;
 
 /* ─── Output: prediction result packed into telemetry ─────────────────── */
@@ -61,6 +59,14 @@ typedef struct {
  *
  * @param s  Pointer to the current sensor data snapshot (non-NULL)
  * @return   LandingPrediction struct with results
+ *
+ * Note: Pass data from TelemetrySnapshot:
+ *   - altitude_m     <- baro_altitude
+ *   - gps_lat        <- latitude
+ *   - gps_lon        <- longitude
+ *   - gps_alt_m      <- gps_altitude
+ *   - gps_satellites <- gps_satellites
+ *   - gps_fix_quality <- gps_fix_quality
  */
 LandingPrediction computeLandingPrediction(SensorData* s);
 

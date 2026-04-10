@@ -36,6 +36,7 @@ import matplotlib.ticker as ticker
 from matplotlib.patches import Circle
 import numpy as np
 import pandas as pd
+import re
 
 # ─── Global style constants ──────────────────────────────────────────────────
 COLOR_TRACK       = "#1a5fa8"
@@ -79,6 +80,306 @@ def haversine_vec(lat1, lon1, lat2, lon2):
          np.cos(phi1) * np.cos(phi2) * np.sin(dlambda / 2.0) ** 2)
     c = 2.0 * np.arctan2(np.sqrt(a), np.sqrt(1.0 - a))
     return R * c
+
+
+# ─── Smart column mapper ─────────────────────────────────────────────────────
+def auto_map_columns(df):
+    """
+    Automatically detect and map CSV columns to required fields based on
+    column name patterns. Returns a dict with standardized column names.
+    """
+    columns = df.columns.tolist()
+    col_lower = [c.lower() for c in columns]
+    
+    mapping = {}
+    
+    # Define search patterns for each required field
+    patterns = {
+        'altitude_m': [r'.*baro.*alt.*', r'.*alt.*baro.*', r'.*altitude.*', r'.*alt_m.*'],
+        'gps_lat': [r'.*lat.*', r'.*latitude.*'],
+        'gps_lon': [r'.*lon.*', r'.*longitude.*'],
+        'gps_alt_m': [r'.*gps.*alt.*', r'.*alt.*gps.*'],
+        'fix_type': [r'.*fix.*type.*', r'.*fix.*qual.*', r'.*gps.*fix.*', r'.*quality.*'],
+        'hdop': [r'.*hdop.*', r'.*dop.*'],
+        'gps_satellites': [r'.*sat.*', r'.*satellite.*'],
+        'pred_lat': [r'.*pred.*lat.*', r'.*predict.*lat.*'],
+        'pred_lon': [r'.*pred.*lon.*', r'.*predict.*lon.*'],
+        'uncertainty_m': [r'.*uncertain.*', r'.*error.*radius.*', r'.*unc_m.*'],
+        't_to_land_s': [r'.*time.*land.*', r'.*ttl.*', r'.*t_to_land.*'],
+        'gps_fallback': [r'.*fallback.*', r'.*gps.*fb.*'],
+        'temperature': [r'.*temp.*'],
+        'pressure': [r'.*press.*'],
+        'accel_x': [r'.*accel.*x.*', r'.*acc_x.*', r'.*ax.*'],
+        'accel_y': [r'.*accel.*y.*', r'.*acc_y.*', r'.*ay.*'],
+        'accel_z': [r'.*accel.*z.*', r'.*acc_z.*', r'.*az.*'],
+        'gyro_x': [r'.*gyro.*x.*', r'.*gyr_x.*', r'.*gx.*'],
+        'gyro_y': [r'.*gyro.*y.*', r'.*gyr_y.*', r'.*gy.*'],
+        'gyro_z': [r'.*gyro.*z.*', r'.*gyr_z.*', r'.*gz.*'],
+        'velocity': [r'.*velocity.*', r'.*vel.*'],
+    }
+    
+    # Try to match each field
+    for field, pattern_list in patterns.items():
+        matched = False
+        for pattern in pattern_list:
+            for i, col in enumerate(col_lower):
+                if re.match(pattern, col):
+                    mapping[field] = columns[i]
+                    matched = True
+                    break
+            if matched:
+                break
+    
+    return mapping
+
+
+def validate_and_prepare_dataframe(df, column_mapping):
+    """
+    Validate that required columns exist and prepare a standardized DataFrame.
+    Returns a new DataFrame with standardized column names.
+    """
+    required_fields = ['altitude_m', 'gps_lat', 'gps_lon']
+    optional_fields = ['gps_alt_m', 'fix_type', 'hdop', 'gps_satellites', 
+                      'uncertainty_m', 't_to_land_s', 'gps_fallback',
+                      'temperature', 'pressure', 'velocity', 'pred_lat', 'pred_lon']
+    
+    # Check required fields
+    missing_required = [f for f in required_fields if f not in column_mapping]
+    if missing_required:
+        print(f"\n  ✗ ERROR: Could not auto-detect required columns: {missing_required}")
+        print(f"\n  Available columns: {list(df.columns)}")
+        print(f"\n  Detected mappings: {column_mapping}")
+        print(f"\n  💡 TIP: Required columns must contain these keywords:")
+        print(f"     - altitude: 'altitude', 'baro', 'alt_m'")
+        print(f"     - latitude: 'lat', 'latitude'")
+        print(f"     - longitude: 'lon', 'longitude'")
+        raise ValueError(f"Missing required columns: {missing_required}")
+    
+    # Report optional fields that were not found
+    missing_optional = [f for f in optional_fields if f not in column_mapping]
+    if missing_optional:
+        print(f"\n  ⚠ Optional columns not found (will calculate/use defaults): {', '.join(missing_optional)}")
+    
+    # Create new DataFrame with standardized names
+    df_std = pd.DataFrame()
+    
+    for std_name, orig_name in column_mapping.items():
+        df_std[std_name] = df[orig_name]
+    
+    # Add default values for missing optional fields
+    if 'fix_type' not in df_std.columns:
+        df_std['fix_type'] = 3  # Assume good fix
+    if 'hdop' not in df_std.columns:
+        df_std['hdop'] = 1.0  # Assume good HDOP
+    if 'gps_satellites' not in df_std.columns:
+        df_std['gps_satellites'] = 8  # Assume good satellite count
+    if 'gps_fallback' not in df_std.columns:
+        df_std['gps_fallback'] = 0
+    if 'gps_alt_m' not in df_std.columns:
+        df_std['gps_alt_m'] = df_std['altitude_m']
+    
+    # Calculate vertical velocity if not present
+    if 'velocity' not in df_std.columns:
+        # Compute vertical velocity from altitude differences
+        df_std['velocity'] = df_std['altitude_m'].diff().fillna(0.0)
+    
+    # Calculate Time to Land iteratively with physical constraints
+    print(f"\n  🧮 Calculating Time to Land at each timestamp...")
+    df_std['t_to_land_s'] = calculate_time_to_land(df_std['altitude_m'].values, 
+                                                     df_std['velocity'].values)
+    
+    # Calculate dynamic predicted landing coordinates
+    print(f"\n  🎯 Calculating dynamic landing predictions...")
+    pred_lat, pred_lon, uncertainty = calculate_dynamic_landing_prediction(
+        df_std['gps_lat'].values,
+        df_std['gps_lon'].values,
+        df_std['t_to_land_s'].values,
+        df_std['altitude_m'].values
+    )
+    
+    df_std['pred_lat'] = pred_lat
+    df_std['pred_lon'] = pred_lon
+    df_std['uncertainty_m'] = uncertainty
+    
+    return df_std
+
+
+def calculate_dynamic_landing_prediction(latitudes, longitudes, ttl_values, altitudes):
+    """
+    Calculate predicted landing coordinates dynamically at each timestamp.
+    
+    Uses iterative horizontal velocity calculation:
+    1. Calculate horizontal drift velocity from GPS position changes
+    2. Project landing point: pred = current_pos + (drift_velocity * time_to_land)
+    3. As TTL → 0, prediction converges to actual GPS position
+    
+    Args:
+        latitudes: array of GPS latitudes (degrees)
+        longitudes: array of GPS longitudes (degrees)
+        ttl_values: array of time to land values (seconds)
+        altitudes: array of altitude values (meters)
+    
+    Returns:
+        tuple: (pred_lat, pred_lon, uncertainty) arrays
+    """
+    n = len(latitudes)
+    pred_lat = np.zeros(n)
+    pred_lon = np.zeros(n)
+    uncertainty = np.zeros(n)
+    
+    # Constants
+    DEG_TO_M = 111320.0  # meters per degree latitude
+    
+    # Initialize first point (no previous data)
+    pred_lat[0] = latitudes[0]
+    pred_lon[0] = longitudes[0]
+    uncertainty[0] = min(200.0, max(5.0, altitudes[0] * 0.1))
+    
+    # Smoothed velocity estimates (exponential moving average)
+    v_north_smooth = 0.0
+    v_east_smooth = 0.0
+    alpha = 0.3  # smoothing factor
+    
+    print(f"\n  📊 Dynamic Prediction Reasoning Trace:")
+    print(f"  " + "=" * 70)
+    
+    for i in range(1, n):
+        dt = 1.0  # assume 1 second between samples
+        
+        # Calculate instantaneous horizontal velocities (m/s)
+        dlat = latitudes[i] - latitudes[i-1]
+        dlon = longitudes[i] - longitudes[i-1]
+        
+        cos_lat = np.cos(np.radians(latitudes[i]))
+        if abs(cos_lat) < 0.001:
+            cos_lat = 0.001
+        
+        v_north_inst = dlat * DEG_TO_M / dt
+        v_east_inst = dlon * DEG_TO_M * cos_lat / dt
+        
+        # Apply exponential smoothing to reduce noise
+        v_north_smooth = alpha * v_north_inst + (1 - alpha) * v_north_smooth
+        v_east_smooth = alpha * v_east_inst + (1 - alpha) * v_east_smooth
+        
+        # Get current time to land
+        ttl = ttl_values[i]
+        
+        # Calculate predicted landing coordinates
+        if np.isnan(ttl) or ttl <= 0:
+            # If not descending or already landed, prediction = current position
+            pred_lat[i] = latitudes[i]
+            pred_lon[i] = longitudes[i]
+        else:
+            # Project landing point using current drift and time to land
+            # pred = current_pos + (drift_velocity * time_to_land)
+            pred_lat[i] = latitudes[i] + (v_north_smooth * ttl) / DEG_TO_M
+            pred_lon[i] = longitudes[i] + (v_east_smooth * ttl) / (DEG_TO_M * cos_lat)
+        
+        # Calculate uncertainty (decreases as altitude decreases)
+        uncertainty[i] = min(200.0, max(5.0, altitudes[i] * 0.1 + abs(v_north_smooth + v_east_smooth) * 0.5))
+        
+        # Print trace for key points
+        if i == 1 or i == n // 2 or i >= n - 3:
+            print(f"\n  Index {i}:")
+            print(f"    Current GPS:     ({latitudes[i]:.7f}°, {longitudes[i]:.7f}°)")
+            print(f"    Altitude:        {altitudes[i]:.2f} m")
+            print(f"    Drift velocity:  N={v_north_smooth:.3f} m/s, E={v_east_smooth:.3f} m/s")
+            print(f"    Time to land:    {ttl:.2f} s" if not np.isnan(ttl) else "    Time to land:    N/A")
+            if not np.isnan(ttl) and ttl > 0:
+                print(f"    Projection:      ({latitudes[i]:.7f}, {longitudes[i]:.7f}) + ")
+                print(f"                     ({v_north_smooth:.3f}, {v_east_smooth:.3f}) * {ttl:.2f}s")
+            print(f"    Predicted:       ({pred_lat[i]:.7f}°, {pred_lon[i]:.7f}°)")
+            print(f"    Uncertainty:     {uncertainty[i]:.1f} m")
+    
+    print(f"  " + "=" * 70)
+    
+    return pred_lat, pred_lon, uncertainty
+
+
+def calculate_time_to_land(altitudes, velocities):
+    """
+    Calculate Time to Land at each timestamp using vectorized operations.
+    
+    Physical constraints:
+    - If altitude = 0, TTL = 0
+    - If velocity >= 0 (climbing/hovering), TTL = NaN
+    - If velocity < 0 (descending), TTL = altitude / |velocity|
+    
+    Args:
+        altitudes: numpy array of altitude values (m)
+        velocities: numpy array of vertical velocity values (m/s, negative = descending)
+    
+    Returns:
+        numpy array of time to land values (seconds)
+    """
+    # Convert to numpy arrays
+    alt = np.array(altitudes, dtype=float)
+    vel = np.array(velocities, dtype=float)
+    
+    # Initialize TTL array with NaN
+    ttl = np.full_like(alt, np.nan, dtype=float)
+    
+    # Apply constraints using vectorized operations
+    # Constraint 1: If altitude is 0, TTL = 0
+    ttl[alt <= 0.0] = 0.0
+    
+    # Constraint 2: If descending (velocity < 0) and altitude > 0, calculate TTL
+    descending_mask = (vel < 0.0) & (alt > 0.0)
+    ttl[descending_mask] = alt[descending_mask] / np.abs(vel[descending_mask])
+    
+    # Constraint 3: If climbing or hovering (velocity >= 0) and altitude > 0, TTL = NaN
+    # (already initialized to NaN, so no action needed)
+    
+    # Print reasoning trace for key points
+    print_reasoning_trace(alt, vel, ttl)
+    
+    return ttl
+
+
+def print_reasoning_trace(altitudes, velocities, ttl_values):
+    """
+    Print reasoning trace for start, midpoint, and near-landing points.
+    """
+    n = len(altitudes)
+    if n == 0:
+        return
+    
+    # Select indices: start, midpoint, near-landing
+    start_idx = 0
+    mid_idx = n // 2
+    
+    # Find near-landing: last point with altitude > 5m
+    near_landing_idx = n - 1
+    for i in range(n - 1, -1, -1):
+        if altitudes[i] > 5.0:
+            near_landing_idx = i
+            break
+    
+    print(f"\n  📊 Reasoning Trace for Time to Land Calculation:")
+    print(f"  " + "=" * 70)
+    
+    for label, idx in [("START", start_idx), ("MIDPOINT", mid_idx), ("NEAR LANDING", near_landing_idx)]:
+        alt = altitudes[idx]
+        vel = velocities[idx]
+        ttl = ttl_values[idx]
+        
+        print(f"\n  {label} (index {idx}):")
+        print(f"    Altitude:  {alt:8.2f} m")
+        print(f"    Velocity:  {vel:8.2f} m/s")
+        
+        if alt <= 0.0:
+            print(f"    Math:      altitude = 0 → TTL = 0")
+            print(f"    TTL:       {ttl:8.2f} s")
+        elif vel >= 0.0:
+            print(f"    Math:      velocity ≥ 0 (not descending) → TTL = N/A")
+            print(f"    TTL:       {'NaN':>8s}")
+        else:
+            print(f"    Math:      TTL = altitude / |velocity|")
+            print(f"               TTL = {alt:.2f} / {abs(vel):.2f}")
+            print(f"               TTL = {ttl:.2f} s")
+            print(f"    TTL:       {ttl:8.2f} s")
+    
+    print(f"  " + "=" * 70)
 
 
 # ─── Style helper ────────────────────────────────────────────────────────────
@@ -333,20 +634,40 @@ def plot_ttl_vs_altitude(df):
     ttl = df["t_to_land_s"].values
     alt = df["altitude_m"].values
 
+    # Filter out NaN values for plotting
+    valid_mask = ~np.isnan(ttl)
+    ttl_valid = ttl[valid_mask]
+    alt_valid = alt[valid_mask]
+    
+    if len(ttl_valid) == 0:
+        print("  ⚠ Warning: No valid TTL values to plot")
+        plt.close(fig)
+        return
+
     # Detect non-monotonic segments (TTL should decrease as altitude drops)
-    mono_mask = np.ones(len(ttl), dtype=bool)
-    for i in range(1, len(ttl)):
-        if ttl[i] > ttl[i - 1] + 0.5:  # tolerance 0.5 s
+    mono_mask = np.ones(len(ttl_valid), dtype=bool)
+    for i in range(1, len(ttl_valid)):
+        if ttl_valid[i] > ttl_valid[i - 1] + 0.5:  # tolerance 0.5 s
             mono_mask[i] = False
 
-    # Plot monotonic in blue, non-monotonic in red
-    ax.plot(alt, ttl, color=COLOR_TRACK, linewidth=1.5, label="Time to land", zorder=3)
+    # Plot valid TTL values
+    ax.plot(alt_valid, ttl_valid, color=COLOR_TRACK, linewidth=1.5, 
+            label="Time to land", zorder=3)
 
+    # Highlight non-monotonic points
     non_mono_idx = np.where(~mono_mask)[0]
     if len(non_mono_idx) > 0:
-        ax.scatter(alt[non_mono_idx], ttl[non_mono_idx], color="red", s=25,
-                   zorder=5, label=f"Non-monotonic ({len(non_mono_idx)} pts)",
+        ax.scatter(alt_valid[non_mono_idx], ttl_valid[non_mono_idx], 
+                   color="red", s=25, zorder=5, 
+                   label=f"Non-monotonic ({len(non_mono_idx)} pts)",
                    edgecolors="darkred", linewidths=0.5)
+    
+    # Show NaN regions if any
+    nan_count = np.sum(~valid_mask)
+    if nan_count > 0:
+        ax.text(0.02, 0.98, f"⚠ {nan_count} points with N/A TTL\n(climbing/hovering)", 
+                transform=ax.transAxes, fontsize=8, verticalalignment='top',
+                bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
 
     ax.invert_xaxis()
 
@@ -391,11 +712,21 @@ def plot_summary_panel(df, errors, actual_lat, actual_lon, launch_lat, launch_lo
 
     # ── Panel (1,0): TTL vs Altitude ──
     ax = axes[1, 0]
-    ax.plot(df["altitude_m"], df["t_to_land_s"], color=COLOR_TRACK, linewidth=1.4)
     ttl = df["t_to_land_s"].values
-    for i in range(1, len(ttl)):
-        if ttl[i] > ttl[i - 1] + 0.5:
-            ax.scatter(df["altitude_m"].iloc[i], ttl[i], color="red", s=20, zorder=5)
+    alt = df["altitude_m"].values
+    
+    # Filter out NaN values
+    valid_mask = ~np.isnan(ttl)
+    ttl_valid = ttl[valid_mask]
+    alt_valid = alt[valid_mask]
+    
+    if len(ttl_valid) > 0:
+        ax.plot(alt_valid, ttl_valid, color=COLOR_TRACK, linewidth=1.4)
+        # Check for non-monotonic points
+        for i in range(1, len(ttl_valid)):
+            if ttl_valid[i] > ttl_valid[i - 1] + 0.5:
+                ax.scatter(alt_valid[i], ttl_valid[i], color="red", s=20, zorder=5)
+    
     ax.invert_xaxis()
     style_axes(ax, xlabel="Altitude (m)", ylabel="TTL (s)", title="Time to Land vs Altitude")
 
@@ -576,16 +907,25 @@ Examples:
             print(f"  ✗ File not found: {args.csv}")
             sys.exit(1)
 
-        df = pd.read_csv(args.csv)
-
-        # Validate required columns
-        required_cols = ["altitude_m", "gps_lat", "gps_lon", "fix_type",
-                         "pred_lat", "pred_lon", "uncertainty_m",
-                         "t_to_land_s", "gps_fallback"]
-        missing = [c for c in required_cols if c not in df.columns]
-        if missing:
-            print(f"  ✗ Missing columns: {missing}")
-            print(f"    Available: {list(df.columns)}")
+        df_raw = pd.read_csv(args.csv)
+        
+        print(f"  ✓ Loaded {len(df_raw)} rows")
+        print(f"\n🔍 Auto-detecting column mappings...")
+        
+        # Auto-detect column mappings
+        column_mapping = auto_map_columns(df_raw)
+        
+        if column_mapping:
+            print(f"  ✓ Detected mappings:")
+            for std_name, orig_name in sorted(column_mapping.items()):
+                print(f"    {std_name:20s} <- {orig_name}")
+        
+        # Validate and prepare standardized DataFrame
+        try:
+            df = validate_and_prepare_dataframe(df_raw, column_mapping)
+            print(f"\n  ✓ Successfully mapped {len(column_mapping)} columns")
+        except ValueError as e:
+            print(f"\n  ✗ Column mapping failed: {e}")
             sys.exit(1)
 
         # Determine actual landing
