@@ -1,0 +1,2 @@
+final_error_m,mean_error_m,min_error_m,max_error_m,final_pred_lat,final_pred_lon,actual_lat,actual_lon,gps_fallback_fraction
+1.43,7.58,0.18,142.67,12.9726851,80.2216488,12.9726753,80.2216403,0.0
